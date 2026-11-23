@@ -1,0 +1,17 @@
+# raw footage: KHO all-sky camera data, not redistributed in this repository
+Clear_sky_footage/
+Cloud_footgae/
+
+# rendered videos (large) and the previous pipeline's outputs
+*.mp4
+*.avi
+outputs/
+outputs_v1_old/
+
+# caches and logs
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.log
+cloudvol/data/scene_*.npz
