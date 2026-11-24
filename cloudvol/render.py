@@ -38,6 +38,8 @@ X0, Y0, WC, HC = 34, 31, 528, 528          # crop that contains the whole lens c
 THETA_CAP = math.radians(89.3)
 H_REF = 1.5                                 # km, reference cloud-base height for source intensities
 SUB = 2                                     # density samples per slab along the ray
+TAU_MAX = 80.0                              # thickness maps encode log1p(tau) / log1p(TAU_MAX)
+R_LENS = 265.0                              # pixel radius of the lens image
 
 
 def _dev():
@@ -81,7 +83,8 @@ def _blur(img, sigma):
 
 
 class Renderer:
-    def __init__(self, scene, scenario, device=None, verbose=False, sub=SUB):
+    def __init__(self, scene, scenario, device=None, verbose=False, sub=None):
+        sub = sub or getattr(scenario, "sub", 0) or SUB
         self.dev = dev = device or _dev()
         self.sc = scenario
         self.light = scenario.lighting
@@ -103,6 +106,12 @@ class Renderer:
         psi = np.arctan2(dy, dx)
         cosp, sinp = np.cos(psi), np.sin(psi)
         self.inside = torch.from_numpy((r < R90 * 0.995).astype(np.float32)).to(dev)
+        # everything the lens images that is not sky: terrain, instruments, rim reflections
+        lens = np.clip((R_LENS + 3.0 - r) / 6.0, 0, 1).astype(np.float32)
+        self.foreground = torch.from_numpy(lens * (1.0 - scene["sky"][sl])).to(dev)
+        # fixed lamps: still bright at the pixel's darkest moment of the hour (aurora is not)
+        low = scene["lampmin"][sl].astype(np.float32) if "lampmin" in scene else np.zeros((HC, WC), np.float32)
+        self.lamps = torch.from_numpy(np.clip((low - 130.0) / 60.0, 0, 1)).to(dev)
 
         # ---------------- plane stack (all layers, sorted by altitude)
         planes = []
@@ -229,10 +238,16 @@ class Renderer:
             yr = -x * si + y * co
             # coverage: two fields drifting through each other, recombined to a uniform marginal
             e = L.evo_speed * t
-            ua = torch.stack([xr / L.cov_period + off[0] + e / L.cov_period,
-                              xr / L.cov_period + off[2] - 0.6 * e / L.cov_period], 0)
-            va = torch.stack([yr / L.cov_period + off[1] + 0.4 * e / L.cov_period,
-                              yr / L.cov_period + off[3] + 0.8 * e / L.cov_period], 0)
+            xc, yc = xr, yr
+            if L.cov_wind_scale != 1.0:
+                # the thickness pattern lags the wind: slow swells with the finer texture streaming through them
+                lag = (1.0 - L.cov_wind_scale) * t
+                xl, yl = x + L.wind[0] * lag, y + L.wind[1] * lag
+                xc, yc = (xl * co + yl * si) / L.aniso, -xl * si + yl * co
+            ua = torch.stack([xc / L.cov_period + off[0] + e / L.cov_period,
+                              xc / L.cov_period + off[2] - 0.6 * e / L.cov_period], 0)
+            va = torch.stack([yc / L.cov_period + off[1] + 0.4 * e / L.cov_period,
+                              yc / L.cov_period + off[3] + 0.8 * e / L.cov_period], 0)
             cov = T["cov"]
             ca = F.grid_sample(cov[:, 0:1], _wrap_grid(ua[0], va[0], 512).reshape(1, n * HC, WC, 2),
                                mode="bilinear", padding_mode="zeros", align_corners=True).view(n, HC, WC)
@@ -246,9 +261,10 @@ class Renderer:
                 amp, ang, pos0, spd, wid = L.front
                 cover = cover + amp * torch.tanh((x * math.cos(ang) + y * math.sin(ang) - (pos0 + spd * t)) / wid)
             # the nominal cover boundary sits mid-ramp, so realised cover tracks the target
-            w = ((c - (1.0 - cover)) / L.edge + 0.5).clamp(0, 1)
+            w = (c - (1.0 - cover)) / L.edge + 0.5
+            w = torch.sigmoid(4.0 * (w - 0.5)) if L.soft_ramp else w.clamp(0, 1)
             top = w ** L.thick_pow                                # relative height of the local cloud top
-            prof = _smoothstep(0.0, 0.14, zrel) * (1 - _smoothstep(0.7 * top, top + 1e-4, zrel))
+            prof = _smoothstep(0.0, L.base_soft, zrel) * (1 - _smoothstep(L.top_soft * top, top + 1e-4, zrel))
             avail = _smoothstep(0.0, 1.0, w) * prof
             # 3-D shape noise at this altitude (slowly boiling), two detail levels + mean
             zc = zabs / L.shape_vperiod + L.boil * t + off[4]
@@ -279,6 +295,9 @@ class Renderer:
             sig = L.sigma * torch.exp(L.core_var * 2.4 * (mod - 0.5))
             # dense cores (power law) wrapped in a thin haze fringe (linear term)
             D[ks] = sig * (L.veil * base + (1 - L.veil) * base ** L.dens_pow)
+            if L.haze > 0:
+                # thin haze filling the slab: thin spots stay hazy and gaps close smoothly toward the horizon
+                D[ks] = D[ks] + L.sigma * L.haze * (4.0 * zrel * (1.0 - zrel)).clamp_min(0) * torch.ones_like(base)
         return D
 
     # ------------------------------------------------------------------ light
@@ -317,11 +336,21 @@ class Renderer:
         a = 1.0 - torch.exp(-delta)
         Tv = torch.ones((HC, WC), device=self.dev)
         Wsingle = torch.zeros_like(Tv); Wdiff = torch.zeros_like(Tv); Wg = torch.zeros_like(Tv)
+        Wdeep = torch.zeros_like(Tv)
         Ws = [torch.zeros_like(Tv) for _ in lt.sources]
+        # Heavy cloud: light that has lost its direction still arrives from a
+        # patch of sky tens of degrees wide; only after tau_deep does it come
+        # from the whole sky.  (tau_deep = 0 keeps the two-level model.)
+        deep = lt.tau_deep > 0
+        m2 = 1.0 - torch.exp(-tau_a / lt.tau_deep) if deep else None
         for k in range(K):
             c = Tv * a[k]
             Wsingle += c * Tt[k] * (1 - m[k])
-            Wdiff += c * Tt[k] * m[k]
+            if deep:
+                Wdiff += c * Tt[k] * m[k] * (1 - m2[k])
+                Wdeep += c * Tt[k] * m[k] * m2[k]
+            else:
+                Wdiff += c * Tt[k] * m[k]
             Wg += c * refl[k] / (1 + kap * tau_b[k])
             for si, s in enumerate(lt.sources):
                 Ws[si] += c * self.E_src[si][k] * refl[k] / (1 + s.kappa * G[si][k])
@@ -329,7 +358,10 @@ class Renderer:
         # mean sky-light transmission of the deck onto the ground (for the snow bounce)
         zen = (self.foot[0] < 4 * self.foot[0].min()) & (self.inside > 0)
         t_deck = (1.0 / (1.0 + kap * U[0]))[zen].mean()
-        return dict(Tv=Tv, Wsingle=Wsingle, Wdiff=Wdiff, Wg=Wg, Ws=Ws, t_deck=t_deck, tau_col=U[0])
+        # mean diffuse reflectance of the deck as seen from the ground (for the snow<->cloud bounce)
+        r_deck = ((kap * U[0]) / (1.0 + kap * U[0]))[zen].mean()
+        return dict(Tv=Tv, Wsingle=Wsingle, Wdiff=Wdiff, Wdeep=Wdeep, Wg=Wg, Ws=Ws, t_deck=t_deck,
+                    r_deck=r_deck, tau_col=U[0], tau_view=delta.sum(0))
 
     # ------------------------------------------------------------------ sky as a light source
     def sky_light(self, lin):
@@ -363,8 +395,14 @@ class Renderer:
         hemi = (num.sum((1, 2)) / den.sum()).view(3, 1, 1).expand(3, HC, WC)
         # single-scatter lobe: sharp forward peak plus a broad tail; diffuse: nearly isotropic
         single = 0.46 * l0 + 0.24 * l1 + 0.16 * l2 + 0.14 * hemi
+        if self.light.tau_deep > 0:
+            # three levels: a glow ~15-30 deg wide (moderately heavy) and the whole sky (very heavy)
+            l3 = nblur(84.0, 16)
+            diffuse = 0.40 * l2 + 0.42 * l3 + 0.18 * hemi
+            deepest = 0.30 * l3 + 0.70 * hemi
+            return single, diffuse, hemi, deepest
         diffuse = 0.25 * l2 + 0.75 * hemi
-        return single, diffuse, hemi
+        return single, diffuse, hemi, None
 
     # ------------------------------------------------------------------ frame
     @torch.no_grad()
@@ -374,14 +412,48 @@ class Renderer:
         t = fi * self.sc.frame_dt
         crop = torch.from_numpy(np.ascontiguousarray(frame[self.sl])).to(dev).permute(2, 0, 1).float() / 255.0
         lin = crop ** GAMMA
-        single, diffuse, hemi = self.sky_light(lin)
+        single, diffuse, hemi, deepest = self.sky_light(lin)
         tr = self.transport(self.density(t))
         Tv = tr["Tv"][None]
         amb = torch.tensor(lt.ambient, device=dev).view(3, 1, 1)
         ground = lt.snow_albedo * tr["t_deck"] * hemi + amb
+        if lt.bounce > 0:
+            # Under a closing deck, light is trapped between snow and cloud base:
+            # each round trip returns bounce * r_deck of it, so the upwelling
+            # light grows as a geometric series.  This is why real heavy overcast
+            # here is brighter than broken cloud, not darker.
+            ground = ground / (1.0 - lt.bounce * tr["r_deck"]).clamp_min(0.15)
         out = lin * Tv + tr["Wsingle"][None] * single + tr["Wdiff"][None] * diffuse + tr["Wg"][None] * ground
+        if deepest is not None:
+            out = out + tr["Wdeep"][None] * deepest
         for si in range(len(lt.sources)):
             out = out + tr["Ws"][si][None] * self.src_color[si]
+        fg = None
+        if lt.relight_foreground:
+            # Snow, instruments and the lens rim are lit by the sky next to them.
+            # When a deck replaces a green aurora sky with its own glow they must
+            # follow, or they stay aurora-green (and aurora remnants at the rim
+            # stay bright) around a tan overcast.  Gain = clouded / clear sky
+            # radiance, averaged over the nearby sky (~25 px) and extended outward
+            # from the sky edge; far from any sky it falls back to the dome mean.
+            # Fixed lamps are emitters and keep their own light.
+            sky_w = self.sky[None]
+            o_lin = out.clamp(0, 1.5)
+            g_all = ((o_lin * sky_w).sum((1, 2)) / (lin * sky_w).sum((1, 2)).clamp_min(1e-4)).view(3, 1, 1)
+
+            def spread(x):
+                y = _blur(F.avg_pool2d(x[None], 4)[0], 6.0)
+                return F.interpolate(y[None], size=(HC, WC), mode="bilinear", align_corners=False)[0]
+
+            eps = 2e-4
+            s_out, s_in, s_w = spread(o_lin * sky_w), spread(lin * sky_w), spread(sky_w)
+            gain = ((s_out + eps * g_all) / (s_in + eps)).clamp(0.1, 6.0)
+            # nothing that merely reflects the sky outshines the sky lighting it: this also
+            # tames clipped aurora remnants in the rim, whose true brightness the gain cannot know
+            sky_mean = (o_lin * sky_w).sum((1, 2)).view(3, 1, 1) / sky_w.sum()
+            local_sky = (s_out + 0.02 * sky_mean) / (s_w + 0.02)
+            relit = torch.minimum(lin * gain, 1.15 * local_sky)
+            fg = (relit * (1 - self.lamps[None]) + lin * self.lamps[None]).clamp(0, 1) ** (1.0 / GAMMA)
         out = out.clamp(0, 1) ** (1.0 / GAMMA)
         # sensor grain: the clear frame's grain is attenuated under cloud, so add back what was lost
         g = torch.Generator(device="cpu").manual_seed(self.sc.seed * 100003 + fi)
@@ -389,7 +461,8 @@ class Renderer:
         nz = _blur(nz, 0.55) * 1.9
         out = out + nz * self.noise_sigma * torch.sqrt((1 - Tv * Tv).clamp(0, 1))
         M = self.sky[None]
-        out = crop * (1 - M) + out.clamp(0, 1) * M
+        ground_px = crop if fg is None else crop * (1 - self.foreground[None]) + fg * self.foreground[None]
+        out = ground_px * (1 - M) + out.clamp(0, 1) * M
         # sensor defects sit on top of whatever the sky does: re-add their excess over the local background
         opened = F.max_pool2d(-F.max_pool2d(-crop[None], 5, 1, 2), 5, 1, 2)[0]
         excess = (lin - opened ** GAMMA).clamp_min(0)
@@ -400,6 +473,14 @@ class Renderer:
             op = ((1 - tr["Tv"]) * self.sky).clamp(0, 1)
             full = np.zeros(frame.shape[:2], np.uint8)
             full[self.sl] = (op * 255 + 0.5).byte().cpu().numpy()
-            return res, dict(opacity=full, t_deck=float(tr["t_deck"]),
+            # thickness: optical depth along the line of sight, log-encoded so it keeps
+            # resolving structure where the opacity mask has saturated to white
+            tv = torch.log1p(tr["tau_view"].clamp(0, TAU_MAX)) / math.log1p(TAU_MAX) * self.sky
+            thick = np.zeros(frame.shape[:2], np.uint8)
+            thick[self.sl] = (tv * 255 + 0.5).clamp(0, 255).byte().cpu().numpy()
+            skyb = self.sky > 0.5
+            tcol = tr["tau_col"][skyb]
+            return res, dict(opacity=full, thickness=thick, t_deck=float(tr["t_deck"]), r_deck=float(tr["r_deck"]),
+                             tau_col_median=float(tcol.median()), tau_col_p10=float(torch.quantile(tcol[::7], 0.1)),
                              cover=float(((tr["tau_col"] > 0.3).float() * self.sky).sum() / self.sky.sum()))
         return res

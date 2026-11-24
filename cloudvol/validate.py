@@ -28,11 +28,24 @@ def measure(path):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("clip"); ap.add_argument("--era", default="A")
+    ap.add_argument("--heavy", action="store_true", help="compare against the heavy reference subset")
     a = ap.parse_args(argv)
     prior = json.load(open(os.path.join(DATA, "prior.json")))
-    env = prior["envelope_A_2015_2018" if a.era == "A" else "envelope_B_2019_2024"]
+    key = "envelope_A_2015_2018" if a.era == "A" else "envelope_B_2019_2024"
     r = measure(a.clip)
     fmt = lambda v: "n/a" if v is None else f"{v:.3f}"
+    if a.heavy:
+        hv = prior["heavy"]; env = hv[key]
+        print(f"{'metric':<22}{'synthetic':>10}   heavy references (p10 / p50 / p90, n={env['n']} clips of this camera era)")
+        d = hv["drift_px_per_frame"]
+        import numpy as np
+        print(f"{'drift px/frame':<22}{fmt(r['drift_px_per_frame']):>10}   {np.percentile(d, [10, 50, 90]).round(2).tolist()}  (all {len(d)} heavy clips)")
+        print(f"{'pattern kept @60s':<22}{fmt(r['survive_60s']):>10}   {hv['survive_60s']}")
+        print(f"{'pattern kept @300s':<22}{fmt(r['survive_300s']):>10}   {hv['survive_300s']}")
+        for k, lab in (("lum_mean", "dome luminance"), ("lum_std_time", "luminance std (time)"), ("contrast", "structure contrast"), ("stars", "star count")):
+            print(f"{lab:<22}{fmt(r[k]):>10}   {env[k]}")
+        return r
+    env = prior[key]
     print(f"{'metric':<22}{'synthetic':>10}   reference")
     print(f"{'drift px/frame':<22}{fmt(r['drift_px_per_frame']):>10}   p10/p50/p90 = {prior['drift_percentiles']['p10']}/{prior['drift_percentiles']['p50']}/{prior['drift_percentiles']['p90']}")
     print(f"{'pattern kept @60s':<22}{fmt(r['survive_60s']):>10}   p10/p50/p90 = {list(prior['survive_60s'].values())}")

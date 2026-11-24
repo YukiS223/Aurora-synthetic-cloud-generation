@@ -73,3 +73,33 @@ class Writer:
         rc = self.p.wait()
         if rc != 0:
             raise RuntimeError(f"ffmpeg encoder failed with code {rc}")
+
+
+class MaskWriter:
+    """Lossless writer for 8-bit single-channel maps (masks).
+
+    Full-range luma with a zero quantiser: every value 0..255 is stored exactly
+    and comes back exactly from both ffmpeg and OpenCV (verified).  Ordinary
+    limited-range video would squeeze 256 levels into 220 and then quantise.
+    """
+
+    def __init__(self, path, w, h, fps=25):
+        self.w, self.h = w, h
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray",
+               "-s", f"{w}x{h}", "-r", str(fps), "-i", "-", "-vf", "scale=out_range=pc",
+               "-c:v", "libx264", "-qp", "0", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+               "-color_range", "pc", "-movflags", "+faststart", str(path)]
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.n = 0
+
+    def write(self, frame):
+        assert frame.shape == (self.h, self.w) and frame.dtype == np.uint8
+        self.p.stdin.write(frame.tobytes())
+        self.n += 1
+
+    def close(self):
+        self.p.stdin.close()
+        rc = self.p.wait()
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg encoder failed with code {rc}")
+

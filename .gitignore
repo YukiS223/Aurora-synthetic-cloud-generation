@@ -1,6 +1,6 @@
 # raw footage: KHO all-sky camera data, not redistributed in this repository
 Clear_sky_footage/
-Cloud_footgae/
+Cloud_footage/
 
 # rendered videos (large) and the previous pipeline's outputs
 *.mp4

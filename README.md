@@ -6,7 +6,9 @@ played at 25 fps). Each run produces a (clear, cloudy, cloud-opacity mask)
 triplet for training cloud-removal models.
 
 The current pipeline is `cloudvol/`: a volumetric cloud renderer whose
-parameters are measured from the 87 real cloudy clips in `Cloud_footgae/`.
+parameters are measured from the 87 real cloudy clips in `Cloud_footage/`. It
+has two scenario families: lighter skies where cloud and clear sky alternate,
+and [heavy clouds](#heavy-clouds) that fill the whole sky like fog.
 
 ## Current result
 
@@ -123,22 +125,161 @@ Contrast is slightly above the reference range; the clear clip itself measures
 Frame-to-frame change under thick cloud is lower than in the clear input, so no
 flicker is added.
 
+## Heavy clouds
+
+`python -m cloudvol.run <clip> --seed N --heavy` samples from a second family
+(`cloudvol/heavy.py`) for decks that cover the whole sky, as in
+`Test 01122022_200653` and `Test 12122022_145216`. Frame 1800 of
+`outputs_cloudvol/26112022_192024_s1_heavy_demo.mp4` — clear input, clouded
+output, and the thickness mask:
+
+![heavy demo: clear | cloudy | thickness](docs/images/demo_heavy_26112022_s1.jpg)
+
+The same family on the older camera, frame 600 of
+`outputs_cloudvol/22112017_195302_s2_heavy_demo.mp4` (two stacked decks): the
+deck takes that camera's green-olive cast, and the aurora survives only as a
+broad glow.
+
+![heavy demo on the 2017 clip: clear | cloudy | thickness](docs/images/demo_heavy_22112017_s2.jpg)
+
+Real heavy cloud (top) beside synthetic (bottom), same camera:
+
+![real heavy references vs synthetic](docs/images/heavy_real_vs_synthetic.jpg)
+
+### What the heavy references show
+
+Eleven of the 87 reference clips keep their stars extinguished for the whole
+hour. Measured on those (`cloudvol/data/prior.json` -> `heavy`):
+
+| quantity (p10 / p50 / p90) | 2015-18 camera (3 clips) | 2019+ camera (8 clips) |
+|---|---|---|
+| dome luminance, 0-255 | 65 / 84 / 97 | 119 / 139 / 143 |
+| mid-scale structure contrast | 0.016 / 0.033 / 0.054 | 0.012 / 0.030 / 0.058 |
+| zenith colour (median) | (71, 108, 59) | (132, 125, 104) |
+| zenith drift, px/frame (all 11) | 0.40 / 0.53 / 1.50 | |
+| pattern kept after 60 s / 300 s (all 11) | 0.83 / 0.62 (median) | |
+
+Three things follow. Heavy cloud is **bright**, not dark: on the newer camera
+it is brighter than broken cloud (139 against 106), because light is trapped
+between the snow and the closed cloud base. Its texture is **faint but never
+absent**: slow swells of thickness and darker thin "wells" that open and
+close. And it **keeps moving** at about the same angular speed as lighter
+cloud, while holding its large-scale pattern slightly longer.
+
+### How heaviness is produced
+
+Not by colour, and not by coverage (the opacity mask is white almost
+everywhere). A heavy deck is the same kind of object as every other cloud
+here — a 3-D density field sampled along each camera ray — with these
+differences:
+
+* **Deep and moderately dense.** The slab is 0.7-1.5 km deep and filled at
+  40-90% of its peak density almost everywhere; overhead optical depth is
+  typically 10-60. Extinction is capped at 70 per km: a deck built from thin,
+  very dense sheets cannot be sampled smoothly and shows every sampling plane
+  as a contour line (it did, before this was fixed).
+* **No thresholds, so no edges.** Thickness follows a smooth (sigmoid) ramp of
+  the coverage field; the cloud base is diffuse, building up over a third of
+  the slab; a residual haze fills the whole slab, so the thinnest spots dim
+  the stars instead of baring them and gaps close smoothly toward the horizon.
+* **Swells lag the wind.** The thickness pattern travels at 25-60% of the wind
+  while finer texture streams through it, which is what gives slow-changing
+  large structure with visible drift.
+* **A second layer for parallax** in two of the four regimes: another deck
+  above with its own wind, or a thin mist layer sliding underneath.
+
+Three lighting extensions are switched on for this family (and are off by
+default, so the lighter regimes render exactly as before):
+
+* **Snow-cloud bounce.** Upwelling light is multiplied by
+  `1 / (1 - bounce x deck reflectance)`: each round trip between snow and
+  cloud base returns part of it. This is what makes a closed deck bright.
+* **Three-level glow.** Light that has lost its direction still arrives from a
+  patch of sky tens of degrees wide; only after ~20 optical depths does it
+  come from the whole sky. Aurora above a heavy deck therefore survives as a
+  broad soft glow rather than vanishing into a uniform tint.
+* **Foreground relighting.** Terrain, instruments and the lens rim are lit by
+  the sky. Under a tan overcast they would otherwise stay aurora-green from
+  the clear frame, so they are rescaled by the ratio of clouded to clear sky
+  radiance nearby (fixed lamps excluded).
+
+Regimes (`heavy.HEAVY_REGIMES`): `fog` (one deep soft deck), `wells` (thins
+into soft dark wells, then closes), `stacked` (two decks, different heights
+and winds), `scud` (deck with a thin mist layer underneath).
+`outputs_cloudvol/variety_heavy_*.jpg` show all four on two clips, each with
+its thickness map.
+
+### Masks
+
+Every run now writes two lossless 8-bit mask videos, zero outside the sky mask:
+
+* `_mask.mp4` — **opacity**, `255 x (1 - T)`, where `T` is the direct
+  transmittance of the clear frame along the line of sight: how much of the
+  clear sky is hidden.
+* `_thickness.mp4` — **optical thickness**, `255 x log1p(tau) / log1p(80)`,
+  where `tau` is the optical depth along the line of sight. Invert with
+  `tau = expm1(v / 255 x log1p(80))`.
+
+Under heavy cloud the opacity mask saturates to white and carries almost no
+information; the thickness map keeps resolving the deck's structure (third
+panel above). Both are stored with full-range lossless H.264, verified to read
+back exactly with both ffmpeg and OpenCV. The formulas are repeated in each
+run's `.json`.
+
+### How the heavy demos score
+
+Scored with the same analysers, against the heavy references of the matching
+camera (`python -m cloudvol.validate <clip> --era B --heavy`):
+
+| measure | `26112022_192024`, seed 1, `wells` | 2019+ heavy references (p10 / p50 / p90) |
+|---|---|---|
+| dome luminance | 145 | 119 / 139 / 143 |
+| mid-scale structure contrast | 0.011 | 0.012 / 0.030 / 0.058 |
+| star count | 2 | 0 / 1 / 3.9 |
+| pattern kept after 60 s | 0.80 | 0.69 / 0.83 / 0.90 |
+| pattern kept after 300 s | 0.53 | 0.47 / 0.62 / 0.70 |
+| drift at zenith, px/frame | 0.17 | 0.40 / 0.53 / 1.50 |
+
+| measure | `22112017_195302`, seed 2, `stacked` | 2015-18 heavy references (p10 / p50 / p90) |
+|---|---|---|
+| dome luminance | 95 | 65 / 84 / 97 |
+| mid-scale structure contrast | 0.011 | 0.016 / 0.033 / 0.054 |
+| star count | 2 | 1 / 1 / 1.8 |
+| pattern kept after 60 s | 0.83 | 0.69 / 0.83 / 0.90 |
+| pattern kept after 300 s | 0.64 | 0.47 / 0.62 / 0.70 |
+| drift at zenith, px/frame | 0.40 | 0.40 / 0.53 / 1.50 |
+
+Brightness, star suppression and persistence land inside the reference
+ranges on both cameras. Two measures do not. Texture contrast is at or just
+below the faint end of the range on both clips: these decks are smoother than
+the typical real one. And on the first clip measured drift is low: the block
+matcher locks onto the slow thickness swells, which were deliberately made to
+lag the wind to get the five-minute persistence right, while the finer texture
+moves at the sampled wind speed.
+
+In frame 1800 the opacity mask is exactly 255 on 78% of sky pixels, while the
+thickness map takes 141 distinct values over those same pixels; where opacity
+is partial the two agree (`exp(-tau)` against `T`, median difference 0.005).
+
 ## Usage
 
 ```
-python -m cloudvol.fit_refs   Cloud_footgae cloudvol/data/ref_stats.json    # once
-python -m cloudvol.fit_motion Cloud_footgae cloudvol/data/ref_motion.json   # once
+python -m cloudvol.fit_refs   Cloud_footage cloudvol/data/ref_stats.json    # once
+python -m cloudvol.fit_motion Cloud_footage cloudvol/data/ref_motion.json   # once
 python -m cloudvol.fit_prior                                                # once
 python -m cloudvol.run Clear_sky_footage/22112017_195302.avi --seed 7 --demo
+python -m cloudvol.run Clear_sky_footage/22112017_195302.avi --seed 7 --heavy --demo-mask
 python -m cloudvol.validate outputs_cloudvol/22112017_195302_s7_cloudy.mp4 --era A
+python -m cloudvol.validate outputs_cloudvol/22112017_195302_s7_heavy_cloudy.mp4 --era A --heavy
 ```
 
-`run` writes `<clip>_s<seed>_cloudy.mp4`, `_mask.mp4` (cloud opacity = 1 -
-direct transmittance), `_demo.mp4` (clear | cloudy, with `--demo`) and
-`<clip>_s<seed>.json` (the scenario). `--regime` forces a regime; `--scenario`
-replays a saved one. Rendering alone takes about 0.3 s per frame on an M3
-(MPS); a full 3600-frame clip with decoding and three encoders takes roughly 45
-minutes.
+`run` writes `<stem>_cloudy.mp4`, `_mask.mp4` and `_thickness.mp4` (see
+[Masks](#masks)), `_demo.mp4` (clear | cloudy with `--demo`; plus the thickness
+map with `--demo-mask`) and `<stem>.json` (the scenario, mask formulas and
+per-frame statistics), where `<stem>` is `<clip>_s<seed>` or
+`<clip>_s<seed>_heavy`. `--regime` forces a regime; `--scenario` replays a
+saved one. A full 3600-frame clip takes roughly 45 minutes on an M3 (MPS), a
+little longer for the heavy family.
 
 Requires python3 with torch, numpy, scipy and opencv, and ffmpeg on PATH.
 
@@ -146,7 +287,7 @@ Requires python3 with torch, numpy, scipy and opencv, and ffmpeg on PATH.
 
 ```
 cloudvol/             current pipeline (see above); cloudvol/data/ holds the fitted reference measurements
-outputs_cloudvol/     scenario of the current demo and the regime variety sheets
+outputs_cloudvol/     scenarios of the demos and the regime variety sheets
 docs/images/          pictures used in this README
 docs/RESEARCH_cloud_realism.md   literature notes written during the previous pipeline (round 7)
 ```
@@ -155,8 +296,8 @@ Kept locally and not part of this repository:
 
 ```
 Clear_sky_footage/    clear clips to cloud (KHO all-sky camera footage)
-Cloud_footgae/        87 real cloudy reference clips ("Test *.avi", KHO all-sky camera footage)
-outputs_cloudvol/*.mp4   current demo, cloudy clip and mask videos
+Cloud_footage/        87 real cloudy reference clips ("Test *.avi", KHO all-sky camera footage)
+outputs_cloudvol/*.mp4   demos, cloudy clips and mask videos
 outputs_v1_old/       previous pipeline's demo videos
 outputs/              previous pipeline's round-6 output video
 ```
@@ -170,6 +311,14 @@ caches are rebuilt automatically on first run.
 * Moonlit and twilight skies are not modelled: adding a moon would change the
   clear sky itself, not only the clouds. Some reference clips are of that kind
   and are not represented.
+* Heavy family: only deep-night lighting is modelled. `Test 12122022_145216`
+  is a twilight clip (sun 17-19 degrees below the horizon) whose cream and
+  blue palette is not reproduced on deep-night clear clips; its structure - a
+  sky-filling deck with a darker core that later breaks up - is. The heavy
+  decks are somewhat smoother than typical real ones, and their measured drift
+  is below the reference range (see the heavy results). The `scud` regime's
+  mist layer can pick up a hard-edged bright patch over the nearby ground
+  light on the 2015-18 camera.
 * Regimes are not equally convincing. Broken decks, scattered fragments,
   two-layer skies and passing fronts look best; the overcast regime can still
   show an over-smooth deck edge, and cloud streets ("rolls") can look streaky.

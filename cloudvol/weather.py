@@ -30,6 +30,11 @@ class Layer:
     dens_pow: float = 2.0          # >1: thin translucent margins, dense cores
     veil: float = 0.08             # fraction of the extinction present as thin haze around the cores
     core_var: float = 0.6          # 0..1, mid-scale variation of density (dark thick cores vs thin sheets)
+    top_soft: float = 0.7          # cloud top fades between top_soft*top and top (lower = more gradual top)
+    base_soft: float = 0.14        # fraction of the slab over which density builds up from the cloud base
+    haze: float = 0.0              # fraction of sigma present as uniform haze through the whole slab
+    soft_ramp: bool = False        # thickness ramp saturates smoothly (sigmoid) instead of clamping: no creases
+    cov_wind_scale: float = 1.0    # the coverage / thickness pattern travels at this fraction of the wind
     cov_period: float = 36.0       # km, tile size of the coverage field
     shape_period: float = 5.0      # km, tile size of the 3-D shape noise
     shape_vperiod: float = 2.4     # km, vertical tile of the shape noise
@@ -62,6 +67,10 @@ class Lighting:
     snow_albedo: float = 0.45      # ground bounce of sky light back onto cloud bases
     kappa: float = 0.16            # diffuse attenuation per unit optical depth (~0.75 (1 - g))
     tau_iso: float = 5.0           # optical depth over which transmitted light loses its direction
+    # --- heavy-cloud extensions; the defaults switch them off so earlier scenarios render unchanged
+    tau_deep: float = 0.0          # >0: optical depth over which a transmitted glow spreads from tens of degrees to the whole sky
+    bounce: float = 0.0            # snow<->cloud multiple reflection of upwelling light under a closed deck (0..~0.85)
+    relight_foreground: bool = False   # re-light terrain and lens rim with the clouded sky's light
 
 
 @dataclass
@@ -71,6 +80,7 @@ class Scenario:
     layers: List[Layer] = field(default_factory=list)
     lighting: Lighting = field(default_factory=Lighting)
     frame_dt: float = 1.0          # seconds of real time per video frame
+    sub: int = 0                   # density samples per slab along the ray (0 = renderer default)
 
     def to_json(self):
         return json.dumps(asdict(self), indent=1)
@@ -83,9 +93,11 @@ class Scenario:
         lg = d["lighting"]
         lighting = Lighting(sources=[Source(**{**s, "color": tuple(s["color"])}) for s in lg["sources"]],
                             ambient=tuple(lg["ambient"]), snow_albedo=lg["snow_albedo"],
-                            kappa=lg["kappa"], tau_iso=lg["tau_iso"])
+                            kappa=lg["kappa"], tau_iso=lg["tau_iso"],
+                            tau_deep=lg.get("tau_deep", 0.0), bounce=lg.get("bounce", 0.0),
+                            relight_foreground=lg.get("relight_foreground", False))
         return Scenario(seed=d["seed"], regime=d["regime"], layers=layers, lighting=lighting,
-                        frame_dt=d.get("frame_dt", 1.0))
+                        frame_dt=d.get("frame_dt", 1.0), sub=d.get("sub", 0))
 
 
 def cover_at(layer, t):

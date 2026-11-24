@@ -63,15 +63,17 @@ def _own_scan(path, step=3):
     n = 0
     out_freq = np.zeros((608, 608)); mean = np.zeros((608, 608, 3)); resid = np.zeros((608, 608, 3))
     prev = None; nacc = []
+    low = np.full((608, 608), 255, np.uint8)
     for _, f in read_frames(path, step=step):
         med = cv2.medianBlur(f, 5)
+        low = np.minimum(low, med.max(-1))            # darkest moment of every pixel: lamps stay bright
         d = f.astype(np.float32) - med
         out_freq += d.max(-1) > 20
         resid += d; mean += f; n += 1
         hp = f.astype(np.float32) - cv2.GaussianBlur(f.astype(np.float32), (0, 0), 1.5)
         nacc.append(np.median(np.abs(hp[200:400, 200:400]), axis=(0, 1)) * 1.4826)
     return dict(out_freq=out_freq / n, mean=mean / n, resid=resid / n,
-                noise_sigma=np.median(np.array(nacc), 0))
+                noise_sigma=np.median(np.array(nacc), 0), lampmin=low)
 
 
 def sky_from_edges(pers):
@@ -102,7 +104,11 @@ def build(path, folders, cache=True, verbose=True):
     name = os.path.basename(path).replace(".avi", "")
     cpath = os.path.join(DATA, f"scene_{name}.npz")
     if cache and os.path.exists(cpath):
-        return dict(np.load(cpath))
+        out = dict(np.load(cpath))
+        if "lampmin" not in out:                      # cache from before lamps were tracked: add it
+            out["lampmin"] = _own_scan(path)["lampmin"]
+            np.savez_compressed(cpath, **out)
+        return out
     sibs = siblings(path, folders)
     if os.path.abspath(path) not in [os.path.abspath(p) for p in sibs]:
         sibs.append(path)
@@ -121,7 +127,7 @@ def build(path, folders, cache=True, verbose=True):
     hot = cv2.dilate(hot.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     out = dict(sky=sky.astype(np.float32), hot=hot, edges=pers, horizon_r=rh,
                mean=own["mean"].astype(np.float32),
-               noise_sigma=own["noise_sigma"].astype(np.float32),
+               noise_sigma=own["noise_sigma"].astype(np.float32), lampmin=own["lampmin"],
                n_siblings=np.int32(len(sibs)))
     os.makedirs(DATA, exist_ok=True)
     np.savez_compressed(cpath, **out)
